@@ -23,3 +23,4 @@ reports/美团/command-log.jsonl
 
 # 组合报告只存本地，不公开
 reports/portfolio-latest.md
+data/

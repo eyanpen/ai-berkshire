@@ -10,22 +10,26 @@
   - 反限流：2-4s 随机抖动 + 每 50 页长休 30s + 连续 5 次超时自动退出保进度
   - 纯转发过滤：只收录被采集用户自己写的内容（text 非空、非"转发微博"）
 
-凭据通过环境变量传入，**不进入代码仓库**：
-  export XQ_PHONE=13xxxxxxxxx
-  export XQ_PASSWORD=xxx
-也可不设，首次运行会弹出 headful 浏览器让你手动登录（扫码/短信/密码随意）。
+凭据来源（不进入代码仓库）：
+  accessToken.json（默认 /home/eyanpen/sourceCode/ppt/accessToken.json，或
+  环境变量 ACCESS_TOKEN_FILE / 参数 --token-file 覆盖）中的
+  stock-blog.Xueqiu.cookies —— 直接注入 cookie 登录。
+  cookie 失效时脚本直接退出并提示更新（本环境无法调用浏览器登录）。
 
 用法示例：
+  # --user-id 是"要爬谁"（目标用户），登录身份由 accessToken.json 决定。
+  # 常用用户ID：
+  #   自己          = 7631018005   （accessToken.json 里 cookie 的 u 值）
+  #   段永平        = 1247347556   （大道无形我有型）
+
   # 段永平关于拼多多
   python3 xueqiu_scraper.py \\
       --user-id 1247347556 \\
       --keywords 拼多多,PDD,Temu,黄峥 \\
       --output ../reports/拼多多/段永平雪球发言-PDD相关.md
 
-  # 其他用户 + 其他关键词
-  python3 xueqiu_scraper.py --user-id 6784593966 --keywords 茅台 --output /tmp/out.md
-
-登录态缓存默认 /tmp/xueqiu_state.json，可用 --state-path 覆盖。
+  # 爬自己的时间线
+  python3 xueqiu_scraper.py --user-id 7631018005 --keywords 茅台 --output /tmp/out.md
 """
 
 import argparse
@@ -57,6 +61,78 @@ def clean(s):
     for ent, rep in [('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'), ('&nbsp;', ' ')]:
         s = s.replace(ent, rep)
     return re.sub(r'&#\d+;', '', s).strip()
+
+
+DEFAULT_TOKEN_FILE = os.environ.get(
+    'ACCESS_TOKEN_FILE', '/home/eyanpen/sourceCode/ppt/accessToken.json'
+)
+
+
+def load_xueqiu_cookies(token_file):
+    """从 accessToken.json 读取雪球 cookie，转成 Playwright cookie 列表。
+
+    期望结构：{"stock-blog": {"Xueqiu": {"cookies": {name: value, ...}}}}
+    关键 cookie：xq_a_token / xqat / u / xq_id_token。
+    文件缺失或字段为空时返回 []（调用方回退到其它登录方式）。
+    """
+    try:
+        with open(token_file, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  [token] 读取 {token_file} 失败: {e}")
+        return []
+    node = (data.get('stock-blog') or {}).get('Xueqiu') or {}
+    raw = node.get('cookies') or {}
+    if not raw:
+        print(f"  [token] {token_file} 中未找到 stock-blog.Xueqiu.cookies")
+        return []
+    cookies = [
+        {'name': name, 'value': str(value), 'domain': '.xueqiu.com', 'path': '/'}
+        for name, value in raw.items()
+    ]
+    print(f"  [token] 已从 accessToken.json 载入 {len(cookies)} 个雪球 cookie")
+    return cookies
+
+
+async def load_with_cookies(pw, cookies, user_id):
+    """用 accessToken.json 中的 cookie 直接建立登录态（无需手动登录）。"""
+    if not cookies:
+        return None
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    )
+    context = await browser.new_context(
+        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        locale='zh-CN',
+        viewport={'width': 1280, 'height': 800},
+    )
+    await context.add_init_script(
+        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+    )
+    try:
+        await context.add_cookies(cookies)
+    except Exception as e:
+        print(f"  注入 cookie 失败: {e}")
+        await browser.close()
+        return None
+    page = await context.new_page()
+    loaded = False
+    for attempt in range(3):
+        try:
+            await page.goto('https://xueqiu.com/', wait_until='domcontentloaded', timeout=15000)
+            loaded = True
+            break
+        except Exception as e:
+            print(f"  首页加载失败(第{attempt+1}次): {e}")
+            await asyncio.sleep(5)
+    await asyncio.sleep(2)
+    if loaded and await verify_login(page, user_id):
+        print("✓ 已使用 accessToken.json 中的雪球 cookie 登录")
+        return browser, context, page
+    print("accessToken.json 中的雪球 cookie 无效或已过期")
+    await browser.close()
+    return None
 
 
 async def browser_fetch_json(page, url, timeout_s=15):
@@ -106,89 +182,6 @@ async def verify_login(page, user_id):
         f'https://xueqiu.com/v4/statuses/user_timeline.json?user_id={user_id}&page=2&count=1'
     )
     return bool(test and test.get('statuses') is not None)
-
-
-async def interactive_login(pw, state_path, user_id):
-    phone = os.environ.get('XQ_PHONE', '')
-    print("\n[需要登录] 将打开 headful 浏览器，请在其中完成雪球登录")
-    if phone:
-        print(f"        环境变量 XQ_PHONE = {phone}   （密码用 XQ_PASSWORD）")
-    else:
-        print("        未设 XQ_PHONE/XQ_PASSWORD，请在浏览器中手动扫码或输入登录信息")
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=['--disable-blink-features=AutomationControlled'],
-    )
-    context = await browser.new_context(
-        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        locale='zh-CN',
-        viewport={'width': 1280, 'height': 800},
-    )
-    await context.add_init_script(
-        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-    )
-    page = await context.new_page()
-    await page.goto('https://xueqiu.com/', wait_until='domcontentloaded')
-    print(">>> 请在浏览器内完成登录；脚本每 5s 轮询，检测成功自动继续（最长 10 分钟）")
-    ok = False
-    for i in range(120):
-        await asyncio.sleep(5)
-        try:
-            if await verify_login(page, user_id):
-                ok = True
-                print(f"  ✓ 登录成功（第 {i+1} 次轮询）")
-                break
-        except Exception as e:
-            print(f"  轮询异常(忽略): {e}")
-        if (i + 1) % 6 == 0:
-            print(f"  ...仍在等待登录（已等 {(i+1)*5}s）")
-    if not ok:
-        print("10 分钟内未检测到登录，退出")
-        await browser.close()
-        return None
-    await context.storage_state(path=state_path)
-    print(f"登录态已保存 → {state_path}")
-    return browser, context, page
-
-
-async def load_with_state(pw, state_path, user_id):
-    if not os.path.exists(state_path):
-        return None
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-    )
-    context = await browser.new_context(
-        storage_state=state_path,
-        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        locale='zh-CN',
-        viewport={'width': 1280, 'height': 800},
-    )
-    await context.add_init_script(
-        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-    )
-    page = await context.new_page()
-    loaded = False
-    for attempt in range(3):
-        try:
-            await page.goto('https://xueqiu.com/', wait_until='domcontentloaded', timeout=15000)
-            loaded = True
-            break
-        except Exception as e:
-            print(f"  首页加载失败(第{attempt+1}次): {e}")
-            await asyncio.sleep(5)
-    if not loaded:
-        try:
-            await page.goto('about:blank')
-        except Exception:
-            pass
-    await asyncio.sleep(2)
-    if await verify_login(page, user_id):
-        print("✓ 已复用保存的登录态")
-        return browser, context, page
-    print("已保存的 state 已过期")
-    await browser.close()
-    return None
 
 
 async def fetch_all_timeline(page, user_id, keywords, progress_path, dump_all_path=''):
@@ -351,13 +344,18 @@ def format_md(collected, user_id, keywords):
 
 def parse_args():
     ap = argparse.ArgumentParser(description="雪球用户时间线爬虫（按关键词筛选本人原发言）")
-    ap.add_argument('--user-id', type=int, help='雪球用户ID（主页URL数字段）')
+    ap.add_argument('--user-id', type=int,
+                    help='要爬取的目标用户ID（主页URL数字段），非登录账号。'
+                         '登录身份来自 accessToken.json 的 cookie。'
+                         '常用ID：自己=7631018005，段永平(大道无形我有型)=1247347556')
     ap.add_argument('--keywords', type=str, default='',
                     help='关键词列表，逗号分隔。例：拼多多,PDD,黄峥,Temu')
     ap.add_argument('--output', type=str, default='', help='markdown 输出路径')
     ap.add_argument('--raw-json', type=str, default='', help='（可选）命中条目原始 JSON 输出路径')
-    ap.add_argument('--state-path', type=str, default='/tmp/xueqiu_state.json',
-                    help='登录态缓存文件（默认 /tmp/xueqiu_state.json）')
+    ap.add_argument('--progress-path', type=str, default='/tmp/xueqiu_progress',
+                    help='断点续爬进度文件前缀（默认 /tmp/xueqiu_progress）')
+    ap.add_argument('--token-file', type=str, default=DEFAULT_TOKEN_FILE,
+                    help=f'凭据文件（默认 {DEFAULT_TOKEN_FILE}），读取 stock-blog.Xueqiu.cookies')
     ap.add_argument('--dump-all', type=str, default='',
                     help='全量缓存路径：爬取时同时把该用户所有原发言写到这里，用于后续离线多主题分析')
     ap.add_argument('--from-cache', type=str, default='',
@@ -398,7 +396,7 @@ async def main():
         print("需要 --user-id")
         return
 
-    progress_path = args.state_path + f'.progress.{args.user_id}'
+    progress_path = args.progress_path + f'.progress.{args.user_id}'
     raw_json = args.raw_json or f'/tmp/xueqiu_{args.user_id}_raw.json'
 
     print("=" * 60)
@@ -406,11 +404,15 @@ async def main():
     print("=" * 60)
 
     async with async_playwright() as pw:
-        session = await load_with_state(pw, args.state_path, args.user_id)
+        # 仅使用 accessToken.json 中的 cookie 登录；失效则退出提示更新
+        cookies = load_xueqiu_cookies(args.token_file)
+        session = await load_with_cookies(pw, cookies, args.user_id)
         if not session:
-            session = await interactive_login(pw, args.state_path, args.user_id)
-        if not session:
-            print("无法登录，退出")
+            print(
+                "\n[登录失败] accessToken.json 中的雪球 cookie 缺失或已过期。\n"
+                f"  请更新 {args.token_file} 里 stock-blog.Xueqiu.cookies\n"
+                "  （从浏览器登录雪球后复制 cookie，关键字段：xq_a_token / xqat / u / xq_id_token）"
+            )
             return
         browser, _, page = session
         collected = await fetch_all_timeline(page, args.user_id, keywords, progress_path, args.dump_all)
